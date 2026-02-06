@@ -100,11 +100,14 @@ class TelegramChannel(BaseChannel):
         self._running = True
         
         # Build the application
-        self._app = (
-            Application.builder()
-            .token(self.config.token)
-            .build()
-        )
+        builder = Application.builder().token(self.config.token)
+        if self.config.proxy:
+            from telegram.request import HTTPXRequest
+            request = HTTPXRequest(proxy=self.config.proxy, connect_timeout=30.0, read_timeout=30.0)
+            builder = builder.request(request).get_updates_request(
+                HTTPXRequest(proxy=self.config.proxy, connect_timeout=30.0, read_timeout=30.0)
+            )
+        self._app = builder.build()
         
         # Add message handler for text, photos, voice, documents
         self._app.add_handler(
@@ -142,12 +145,17 @@ class TelegramChannel(BaseChannel):
     async def stop(self) -> None:
         """Stop the Telegram bot."""
         self._running = False
-        
+
         if self._app:
             logger.info("Stopping Telegram bot...")
-            await self._app.updater.stop()
-            await self._app.stop()
-            await self._app.shutdown()
+            try:
+                if self._app.updater and self._app.updater.running:
+                    await self._app.updater.stop()
+                if self._app.running:
+                    await self._app.stop()
+                await self._app.shutdown()
+            except Exception as e:
+                logger.warning(f"Error during Telegram shutdown: {e}")
             self._app = None
     
     async def send(self, msg: OutboundMessage) -> None:

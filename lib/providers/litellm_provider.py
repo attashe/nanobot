@@ -1,54 +1,61 @@
-"""LiteLLM provider implementation for multi-provider support."""
+"""OpenAI-compatible provider using httpx.
 
-import os
+All supported backends (OpenRouter, vLLM, Moonshot/Kimi) expose the
+standard POST /v1/chat/completions endpoint, so a single httpx client
+covers all of them.
+"""
+
+import json
 from typing import Any
 
-import litellm
-from litellm import acompletion
+import httpx
+from loguru import logger
 
 from lib.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 
+# Default base URLs per provider
+_OPENROUTER_BASE = "https://openrouter.ai/api/v1"
+_MOONSHOT_BASE = "https://api.moonshot.cn/v1"
+
 
 class LiteLLMProvider(LLMProvider):
-    """
-    LLM provider using LiteLLM for multi-provider support.
-
-    Supports OpenRouter, vLLM, and Moonshot/Kimi providers.
-    """
+    """OpenAI-compatible chat completions provider (no litellm dependency)."""
 
     def __init__(
         self,
         api_key: str | None = None,
         api_base: str | None = None,
-        default_model: str = "anthropic/claude-opus-4-5"
+        default_model: str = "anthropic/claude-opus-4-5",
     ):
         super().__init__(api_key, api_base)
         self.default_model = default_model
 
-        # Detect OpenRouter by api_key prefix or explicit api_base
-        self.is_openrouter = (
-            (api_key and api_key.startswith("sk-or-")) or
-            (api_base and "openrouter" in api_base)
+        # Resolve the actual base URL
+        self._base_url = self._resolve_base_url(api_key, api_base, default_model)
+
+        self._client = httpx.AsyncClient(
+            base_url=self._base_url,
+            headers={
+                "Content-Type": "application/json",
+                **({"Authorization": f"Bearer {api_key}"} if api_key else {}),
+            },
+            timeout=httpx.Timeout(300.0, connect=10.0),
         )
 
-        # Track if using custom endpoint (vLLM, etc.)
-        self.is_vllm = bool(api_base) and not self.is_openrouter
-
-        # Configure LiteLLM based on provider
-        if api_key:
-            if self.is_openrouter:
-                os.environ["OPENROUTER_API_KEY"] = api_key
-            elif self.is_vllm:
-                os.environ["HOSTED_VLLM_API_KEY"] = api_key
-            elif "moonshot" in default_model or "kimi" in default_model:
-                os.environ.setdefault("MOONSHOT_API_KEY", api_key)
-                os.environ.setdefault("MOONSHOT_API_BASE", api_base or "https://api.moonshot.cn/v1")
-
+    @staticmethod
+    def _resolve_base_url(
+        api_key: str | None, api_base: str | None, model: str
+    ) -> str:
+        """Pick the right base URL from explicit config or model name heuristics."""
         if api_base:
-            litellm.api_base = api_base
-
-        # Disable LiteLLM logging noise
-        litellm.suppress_debug_info = True
+            return api_base.rstrip("/")
+        if api_key and api_key.startswith("sk-or-"):
+            return _OPENROUTER_BASE
+        ml = model.lower()
+        if "moonshot" in ml or "kimi" in ml:
+            return _MOONSHOT_BASE
+        # OpenRouter as default (most models go through it)
+        return _OPENROUTER_BASE
 
     async def chat(
         self,
@@ -58,88 +65,71 @@ class LiteLLMProvider(LLMProvider):
         max_tokens: int = 4096,
         temperature: float = 0.7,
     ) -> LLMResponse:
-        """Send a chat completion request via LiteLLM."""
+        """Send a chat completion request."""
         model = model or self.default_model
-
-        # For OpenRouter, prefix model name if not already prefixed
-        if self.is_openrouter and not model.startswith("openrouter/"):
-            model = f"openrouter/{model}"
-
-        # For Moonshot/Kimi, ensure moonshot/ prefix (before vLLM check)
-        if ("moonshot" in model.lower() or "kimi" in model.lower()) and not (
-            model.startswith("moonshot/") or model.startswith("openrouter/")
-        ):
-            model = f"moonshot/{model}"
-
-        # For vLLM, use hosted_vllm/ prefix per LiteLLM docs
-        if self.is_vllm:
-            model = f"hosted_vllm/{model}"
 
         # kimi-k2.5 only supports temperature=1.0
         if "kimi-k2.5" in model.lower():
             temperature = 1.0
 
-        kwargs: dict[str, Any] = {
+        body: dict[str, Any] = {
             "model": model,
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
-
-        # Pass api_base directly for custom endpoints (vLLM, etc.)
-        if self.api_base:
-            kwargs["api_base"] = self.api_base
-
         if tools:
-            kwargs["tools"] = tools
-            kwargs["tool_choice"] = "auto"
+            body["tools"] = tools
+            body["tool_choice"] = "auto"
 
         try:
-            response = await acompletion(**kwargs)
-            return self._parse_response(response)
+            resp = await self._client.post("/chat/completions", json=body)
+            resp.raise_for_status()
+            return self._parse_response(resp.json())
+        except httpx.HTTPStatusError as e:
+            detail = e.response.text[:500] if e.response else str(e)
+            logger.error(f"LLM API error {e.response.status_code}: {detail}")
+            return LLMResponse(content=f"Error calling LLM: {detail}", finish_reason="error")
         except Exception as e:
-            return LLMResponse(
-                content=f"Error calling LLM: {str(e)}",
-                finish_reason="error",
+            logger.error(f"LLM request failed: {e}")
+            return LLMResponse(content=f"Error calling LLM: {e}", finish_reason="error")
+
+    def _parse_response(self, data: dict[str, Any]) -> LLMResponse:
+        """Parse an OpenAI-compatible JSON response."""
+        choice = data["choices"][0]
+        message = choice["message"]
+
+        tool_calls: list[ToolCallRequest] = []
+        for tc in message.get("tool_calls") or []:
+            args = tc["function"]["arguments"]
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = {"raw": args}
+            tool_calls.append(
+                ToolCallRequest(
+                    id=tc["id"],
+                    name=tc["function"]["name"],
+                    arguments=args,
+                )
             )
 
-    def _parse_response(self, response: Any) -> LLMResponse:
-        """Parse LiteLLM response into our standard format."""
-        choice = response.choices[0]
-        message = choice.message
-
-        tool_calls = []
-        if hasattr(message, "tool_calls") and message.tool_calls:
-            for tc in message.tool_calls:
-                args = tc.function.arguments
-                if isinstance(args, str):
-                    import json
-                    try:
-                        args = json.loads(args)
-                    except json.JSONDecodeError:
-                        args = {"raw": args}
-
-                tool_calls.append(ToolCallRequest(
-                    id=tc.id,
-                    name=tc.function.name,
-                    arguments=args,
-                ))
-
         usage = {}
-        if hasattr(response, "usage") and response.usage:
+        if "usage" in data and data["usage"]:
+            u = data["usage"]
             usage = {
-                "prompt_tokens": response.usage.prompt_tokens,
-                "completion_tokens": response.usage.completion_tokens,
-                "total_tokens": response.usage.total_tokens,
+                "prompt_tokens": u.get("prompt_tokens", 0),
+                "completion_tokens": u.get("completion_tokens", 0),
+                "total_tokens": u.get("total_tokens", 0),
             }
 
         return LLMResponse(
-            content=message.content,
+            content=message.get("content"),
             tool_calls=tool_calls,
-            finish_reason=choice.finish_reason or "stop",
+            finish_reason=choice.get("finish_reason") or "stop",
             usage=usage,
         )
 
     def get_default_model(self) -> str:
-        """Get the default model."""
         return self.default_model

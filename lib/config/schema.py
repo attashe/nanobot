@@ -85,17 +85,19 @@ class Config(BaseSettings):
         return Path(self.agents.defaults.workspace).expanduser()
 
     def _match_provider(self, model: str | None = None) -> ProviderConfig | None:
-        """Match a provider based on model name."""
+        """Match a provider based on model name or configured api_base."""
         model = (model or self.agents.defaults.model).lower()
         providers = {
             "openrouter": self.providers.openrouter,
             "moonshot": self.providers.moonshot,
             "kimi": self.providers.moonshot,
-            "vllm": self.providers.vllm,
         }
         for keyword, provider in providers.items():
             if keyword in model and provider.api_key:
                 return provider
+        # vLLM: match if api_base is configured (model name usually won't contain "vllm")
+        if self.providers.vllm.api_base and self.providers.vllm.api_key:
+            return self.providers.vllm
         return None
 
     def get_api_key(self, model: str | None = None) -> str | None:
@@ -113,11 +115,12 @@ class Config(BaseSettings):
         return None
 
     def get_api_base(self, model: str | None = None) -> str | None:
-        """Get API base URL based on model name."""
+        """Get API base URL based on model name or configured provider."""
         model = (model or self.agents.defaults.model).lower()
         if "openrouter" in model:
             return self.providers.openrouter.api_base or "https://openrouter.ai/api/v1"
-        if "vllm" in model:
+        # vLLM: return api_base if configured (model name usually won't contain "vllm")
+        if self.providers.vllm.api_base:
             return self.providers.vllm.api_base
         return None
 
